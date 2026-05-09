@@ -500,4 +500,119 @@ void dense_softmax(
   }
 }
 
+inline int32 round_div_signed_i64(int64 num, int64 den) {
+  if (den <= 0) return 0;
+  if (num >= 0) return (int32)((num + den / 2) / den);
+  return (int32)(-(((-num) + den / 2) / den));
+}
+
+inline uint32 isqrt_u64(uint64 x) {
+  uint64 op = x;
+  uint64 res = 0;
+  uint64 one = (uint64)1 << 62;
+
+  while (one > op) {
+    one >>= 2;
+  }
+
+  while (one != 0) {
+    if (op >= res + one) {
+      op -= res + one;
+      res = (res >> 1) + one;
+    } else {
+      res >>= 1;
+    }
+    one >>= 2;
+  }
+
+  return (uint32)res;
+}
+
+// Row-wise integer LayerNorm over each full feature row.
+// Input/output use the existing tiled stream order:
+// (Tm, Tn, m, n), where FEATURES = Tn * n.
+template <
+  int m,
+  int n,
+  int Tm,
+  int Tn,
+  int OUTPUT_SCALE,
+  int EPS,
+  int AFFINE_SHIFT,
+  int SQRT_FEATURES_SHIFT,
+  int SQRT_FEATURES_SCALE,
+  bool has_affine
+>
+void layernorm(
+  input_stream_int8 * __restrict sA,
+  output_stream_int8 * __restrict sC,
+  const int16 gamma [],
+  const int16 beta []
+) {
+  aie::set_saturation(aie::saturation_mode::saturate);
+
+  using V = aie::vector<int8, m*n>;
+  constexpr int FEATURES = Tn * n;
+  constexpr int SQRT_DEN = 1 << SQRT_FEATURES_SHIFT;
+
+  int8 x_buf[m][FEATURES];
+  int8 y_buf[m][FEATURES];
+
+  for (unsigned im = 0; im < Tm; ++im) {
+    for (unsigned in = 0; in < Tn; ++in) {
+      V tile = readincr_v<m*n>(sA);
+      const unsigned base_col = in * n;
+      for (unsigned r = 0; r < m; ++r) {
+        for (unsigned c = 0; c < n; ++c) {
+          x_buf[r][base_col + c] = tile[r * n + c];
+        }
+      }
+    }
+
+    for (unsigned r = 0; r < m; ++r) {
+      int32 sum = 0;
+      for (unsigned col = 0; col < FEATURES; ++col) {
+        sum += (int32)x_buf[r][col];
+      }
+
+      const int32 mean = round_div_signed_i64((int64)sum, FEATURES);
+
+      uint64 var_sum = 0;
+      for (unsigned col = 0; col < FEATURES; ++col) {
+        const int32 centered = (int32)x_buf[r][col] - mean;
+        var_sum += (uint64)((int64)centered * (int64)centered);
+      }
+
+      uint32 denom = isqrt_u64(var_sum + (uint64)EPS);
+      if (denom == 0) denom = 1;
+
+      for (unsigned col = 0; col < FEATURES; ++col) {
+        const int32 centered = (int32)x_buf[r][col] - mean;
+        const int64 norm_num = (int64)centered * OUTPUT_SCALE * SQRT_FEATURES_SCALE;
+        int32 y = round_div_signed_i64(norm_num, (int64)denom * SQRT_DEN);
+
+        if constexpr (has_affine) {
+          y = round_div_signed_i64((int64)y * (int64)gamma[col], (int64)1 << AFFINE_SHIFT);
+          y += (int32)beta[col];
+        }
+
+        if (y > 127) y = 127;
+        if (y < -128) y = -128;
+        y_buf[r][col] = (int8)y;
+      }
+    }
+
+    for (unsigned in = 0; in < Tn; ++in) {
+      V tile;
+      const unsigned base_col = in * n;
+      for (unsigned r = 0; r < m; ++r) {
+        for (unsigned c = 0; c < n; ++c) {
+          tile[r * n + c] = y_buf[r][base_col + c];
+        }
+      }
+      writeincr(sC, tile);
+    }
+  }
+}
+
 #endif
