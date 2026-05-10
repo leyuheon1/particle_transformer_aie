@@ -14,6 +14,12 @@ def _round_div_signed(num: int, den: int) -> int:
     return -((-num + den // 2) // den)
 
 
+def _round_shift_signed(num: int, shift: int) -> int:
+    if shift <= 0:
+        return num
+    return _round_div_signed(num, 1 << shift)
+
+
 class LayerNormLayer(AIELayer):
     """
     Integer row-wise LayerNorm for int8 AIE streams.
@@ -38,6 +44,7 @@ class LayerNormLayer(AIELayer):
         eps: int = 1,
         affine_shift: int = 8,
         sqrt_features_shift: int = 12,
+        norm_shift: int = 16,
     ):
         super().__init__(name, 'layernorm', params={
             'gamma': gamma,
@@ -46,6 +53,7 @@ class LayerNormLayer(AIELayer):
             'eps': int(eps),
             'affine_shift': int(affine_shift),
             'sqrt_features_shift': int(sqrt_features_shift),
+            'norm_shift': int(norm_shift),
         })
 
         if output_scale <= 0:
@@ -56,11 +64,14 @@ class LayerNormLayer(AIELayer):
             raise ValueError(f"LayerNormLayer {name}: affine_shift must be non-negative")
         if sqrt_features_shift < 0:
             raise ValueError(f"LayerNormLayer {name}: sqrt_features_shift must be non-negative")
+        if norm_shift < 0:
+            raise ValueError(f"LayerNormLayer {name}: norm_shift must be non-negative")
 
         self.output_scale = int(output_scale)
         self.eps = int(eps)
         self.affine_shift = int(affine_shift)
         self.sqrt_features_shift = int(sqrt_features_shift)
+        self.norm_shift = int(norm_shift)
 
         self._gamma_source = None if gamma is None else np.asarray(gamma)
         self._beta_source = None if beta is None else np.asarray(beta)
@@ -142,11 +153,14 @@ class LayerNormLayer(AIELayer):
             if denom <= 0:
                 denom = 1
 
+            norm_factor_num = self.output_scale * sqrt_features_scale * (1 << self.norm_shift)
+            norm_factor_den = denom * sqrt_den
+            norm_factor = _round_div_signed(norm_factor_num, norm_factor_den)
+
             for col in range(features):
-                num = int(centered[col]) * self.output_scale * sqrt_features_scale
-                norm = _round_div_signed(num, denom * sqrt_den)
+                norm = _round_shift_signed(int(centered[col]) * norm_factor, self.norm_shift)
                 if self.has_affine:
-                    norm = _round_div_signed(int(norm) * int(self.gamma[col]), 1 << self.affine_shift)
+                    norm = _round_shift_signed(int(norm) * int(self.gamma[col]), self.affine_shift)
                     norm += int(self.beta[col])
                 a[row, col] = np.int8(np.clip(norm, -128, 127))
 
@@ -178,7 +192,7 @@ class LayerNormLayer(AIELayer):
         f.write(
             f'layernorm<{self.m}, {self.n}, {t_m}, {t_n}, {self.output_scale}, '
             f'{self.eps}, {self.affine_shift}, {self.sqrt_features_shift}, '
-            f'{sqrt_features_scale}, {has_affine_str}>'
+            f'{sqrt_features_scale}, {self.norm_shift}, {has_affine_str}>'
         )
         if self.has_affine:
             f.write(' (x, a, gamma_p, beta_p);}\n')
@@ -210,5 +224,5 @@ class LayerNormLayer(AIELayer):
         affine = "affine" if self.has_affine else "no_affine"
         return (
             f"LayerNormLayer({idx_str}, name='{self.name}', output_scale={self.output_scale}, "
-            f"eps={self.eps}, {affine})"
+            f"eps={self.eps}, norm_shift={self.norm_shift}, {affine})"
         )

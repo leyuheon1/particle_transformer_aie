@@ -506,6 +506,13 @@ inline int32 round_div_signed_i64(int64 num, int64 den) {
   return (int32)(-(((-num) + den / 2) / den));
 }
 
+inline int32 round_shift_signed_i64(int64 num, int shift) {
+  if (shift <= 0) return (int32)num;
+  const int64 half = (int64)1 << (shift - 1);
+  if (num >= 0) return (int32)((num + half) >> shift);
+  return (int32)(-(((-num) + half) >> shift));
+}
+
 inline uint32 isqrt_u64(uint64 x) {
   uint64 op = x;
   uint64 res = 0;
@@ -541,6 +548,7 @@ template <
   int AFFINE_SHIFT,
   int SQRT_FEATURES_SHIFT,
   int SQRT_FEATURES_SCALE,
+  int NORM_SHIFT,
   bool has_affine
 >
 void layernorm(
@@ -586,13 +594,16 @@ void layernorm(
       uint32 denom = isqrt_u64(var_sum + (uint64)EPS);
       if (denom == 0) denom = 1;
 
+      const int64 norm_factor_num = (int64)OUTPUT_SCALE * SQRT_FEATURES_SCALE * ((int64)1 << NORM_SHIFT);
+      const int64 norm_factor_den = (int64)denom * SQRT_DEN;
+      const int32 norm_factor = round_div_signed_i64(norm_factor_num, norm_factor_den);
+
       for (unsigned col = 0; col < FEATURES; ++col) {
         const int32 centered = (int32)x_buf[r][col] - mean;
-        const int64 norm_num = (int64)centered * OUTPUT_SCALE * SQRT_FEATURES_SCALE;
-        int32 y = round_div_signed_i64(norm_num, (int64)denom * SQRT_DEN);
+        int32 y = round_shift_signed_i64((int64)centered * norm_factor, NORM_SHIFT);
 
         if constexpr (has_affine) {
-          y = round_div_signed_i64((int64)y * (int64)gamma[col], (int64)1 << AFFINE_SHIFT);
+          y = round_shift_signed_i64((int64)y * (int64)gamma[col], AFFINE_SHIFT);
           y += (int32)beta[col];
         }
 
